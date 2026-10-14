@@ -6,8 +6,13 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+import hashlib
+import html
+import secrets
+
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -23,16 +28,25 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    aadhaar_digest,
+    generate_otp,
     generate_reset_code,
     hash_password,
+    is_valid_aadhaar,
+    normalise_aadhaar,
     normalise_reset_code,
     verify_password,
 )
 from app.db.session import get_db
-from app.models import Citizen, PasswordReset, RegistrationRequest, User, Village
-from app.services import ratelimit
+from app.models import AuthAttempt, Citizen, KnownDevice, LoginChallenge, PasswordReset, RegistrationRequest, User, Village
+from app.services import notify, ratelimit
 from app.schemas import (
+    LoginChallengeOut,
+    LoginChallengeStatus,
     LoginRequest,
+    OtpRequest,
+    OtpReset,
+    OtpSent,
     PasswordChange,
     PasswordResetIssued,
     PasswordResetRedeem,
@@ -56,11 +70,106 @@ def _issue(user: User) -> TokenPair:
     )
 
 
-@router.post("/login", response_model=TokenPair)
+def _account_key(db: Session, email: str | None, aadhaar: str | None) -> str:
+    """The email an identifier resolves to, or a stable stand-in if none does.
+
+    Aadhaar sign-in resolves the number to the resident, then to their account,
+    and from there behaves exactly like email sign-in — same throttle, same
+    audit row, same refusal. An Aadhaar that matches nobody gets a pseudonymous
+    key derived from its digest, so it is throttled identically to a real one
+    and the response cannot reveal whether the number is registered.
+    """
+    if email:
+        return email.lower().strip()
+    digits = normalise_aadhaar(aadhaar)
+    if not is_valid_aadhaar(digits):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="An Aadhaar number has 12 digits and does not start with 0 or 1.",
+        )
+    digest = aadhaar_digest(digits)
+    citizen = db.scalar(select(Citizen).where(Citizen.aadhaar_hash == digest))
+    if citizen is not None:
+        user = db.scalar(select(User).where(User.citizen_id == citizen.id))
+        if user is not None:
+            return user.email
+    return f"aadhaar:{digest[:24]}"
+
+
+DEMO_DOMAINS = ("@panchayat.gov.in", "@citizen.panchayat.gov.in")
+
+
+def _is_demo_account(email: str) -> bool:
+    """Seeded demo accounts are shared across every laptop at a presentation,
+    so they never wait for new-device approval: the listed addresses, and any
+    address on the demo domains the seed uses."""
+    email = email.lower()
+    return email in settings.device_check_exempt or email.endswith(DEMO_DOMAINS)
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _new_device_challenge(
+    db: Session, user: User, body: LoginRequest, request: Request, ip: str | None
+) -> LoginChallengeOut | None:
+    """Hold a sign-in from a device this account has never used.
+
+    The first device an account signs in from is trusted as its home device,
+    so nobody is challenged on their very first sign-in. After that, a correct
+    password from an unknown device is not enough on its own: an alert goes to
+    the phone and email on record, and the owner approves or denies it.
+    """
+    if not settings.NEW_DEVICE_APPROVAL or _is_demo_account(user.email):
+        return None  # shared demo account: let every device in
+    device_hash = _sha(f"{user.id}:{body.device_id or 'no-device-id'}")
+    known = list(db.scalars(select(KnownDevice).where(KnownDevice.user_id == user.id)))
+    if not known:
+        db.add(KnownDevice(id=f"dev_{uuid4().hex[:16]}", user_id=user.id,
+                           device_hash=device_hash, label=body.device_label))
+        db.commit()
+        return None
+    if any(d.device_hash == device_hash for d in known):
+        return None
+
+    poll, decision = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+    challenge = LoginChallenge(
+        id=f"lch_{uuid4().hex[:16]}", user_id=user.id, device_hash=device_hash,
+        label=(body.device_label or "Unknown browser")[:200], ip=ip,
+        poll_hash=_sha(poll), decision_hash=_sha(decision),
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(minutes=settings.LOGIN_APPROVAL_TTL_MINUTES),
+    )
+    db.add(challenge)
+    db.commit()
+
+    url = (
+        f"{str(request.base_url).rstrip('/')}{settings.API_V1_PREFIX}"
+        f"/auth/login-challenges/{challenge.id}/decide?token={decision}"
+    )
+    phone = user.citizen.phone if user.citizen else None
+    notify.send_new_device_alert(phone=phone, email=user.email,
+                                 device=challenge.label, decision_url=url)
+    ratelimit.record(db, email=user.email, ip=ip, outcome="device_challenged", user_id=user.id)
+    return LoginChallengeOut(
+        challenge_id=challenge.id,
+        poll_token=poll,
+        sent_to=[*([_mask_phone(phone)] if phone else []), _mask_email(user.email)],
+        expires_in_minutes=settings.LOGIN_APPROVAL_TTL_MINUTES,
+        demo_decision_url=url if settings.OTP_DEMO_MODE else None,
+    )
+
+
+@router.post(
+    "/login",
+    response_model=TokenPair,
+    responses={202: {"model": LoginChallengeOut, "description": "New device: approval pending"}},
+)
 def login(
     body: LoginRequest, request: Request, db: Session = Depends(get_db)
 ) -> TokenPair:
-    email = body.email.lower()
+    email = _account_key(db, body.email, body.aadhaar)
     ip = ratelimit.client_ip(request)
 
     # Before the password is checked, not after: a throttled attempt should not
@@ -118,7 +227,11 @@ def login(
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password.",
+            detail=(
+                "Incorrect Aadhaar number or password."
+                if body.aadhaar and not body.email
+                else "Incorrect email or password."
+            ),
         )
     if not user.is_active:
         # Correct password, disabled account. Recorded, but not a guess.
@@ -130,12 +243,111 @@ def login(
             detail="This account has been deactivated. Contact the Panchayat office.",
         )
 
+    challenge = _new_device_challenge(db, user, body, request, ip)
+    if challenge is not None:
+        return JSONResponse(status_code=202, content=challenge.model_dump(by_alias=True))
+
     user.last_login_at = datetime.now(timezone.utc)
     db.commit()
     ratelimit.record(
         db, email=email, ip=ip, outcome="ok", successful=True, user_id=user.id
     )
     return _issue(user)
+
+
+def _load_challenge(db: Session, challenge_id: str) -> LoginChallenge:
+    challenge = db.get(LoginChallenge, challenge_id)
+    if challenge is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown sign-in request.")
+    if challenge.status == "pending" and as_utc(challenge.expires_at) <= datetime.now(timezone.utc):
+        challenge.status = "expired"
+        db.commit()
+    return challenge
+
+
+@router.get("/login-challenges/{challenge_id}", response_model=LoginChallengeStatus)
+def poll_login_challenge(
+    challenge_id: str, poll: str, request: Request, db: Session = Depends(get_db)
+) -> LoginChallengeStatus:
+    """The waiting device asks whether the owner has answered yet."""
+    challenge = _load_challenge(db, challenge_id)
+    if not secrets.compare_digest(challenge.poll_hash, _sha(poll)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown sign-in request.")
+    if challenge.status != "approved":
+        return LoginChallengeStatus(status="denied" if challenge.status == "used" else challenge.status)
+
+    user = db.get(User, challenge.user_id)
+    if user is None or not user.is_active:
+        return LoginChallengeStatus(status="denied")
+    # Tokens are handed over exactly once, and the device becomes trusted.
+    challenge.status = "used"
+    db.add(KnownDevice(id=f"dev_{uuid4().hex[:16]}", user_id=user.id,
+                       device_hash=challenge.device_hash, label=challenge.label))
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+    ratelimit.record(db, email=user.email, ip=ratelimit.client_ip(request),
+                     outcome="ok", successful=True, user_id=user.id)
+    return LoginChallengeStatus(status="approved", tokens=_issue(user))
+
+
+def _decision_page(title: str, body_html: str) -> HTMLResponse:
+    return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,sans-serif;
+background:linear-gradient(135deg,#0c1838,#142a63);color:#1e293b}}.c{{background:#fff;border-radius:16px;
+padding:28px;max-width:380px;width:calc(100% - 32px);box-shadow:0 20px 40px -12px #0008;border-top:4px solid #ff8a1f}}
+h1{{font-size:20px;margin:0 0 8px;color:#0f1f4b}}p{{font-size:14px;line-height:1.5;color:#475569}}
+.r{{display:flex;gap:10px;margin-top:18px}}button{{flex:1;padding:12px;border:0;border-radius:10px;font-weight:700;
+font-size:14px;cursor:pointer}}.a{{background:#13a05a;color:#fff}}.d{{background:#e11d48;color:#fff}}
+dl{{font-size:13px;background:#f1f5f9;border-radius:10px;padding:10px 14px}}dt{{font-weight:700}}dd{{margin:0 0 6px}}</style>
+</head><body><div class="c">{body_html}</div></body></html>""")
+
+
+@router.get("/login-challenges/{challenge_id}/decide", response_class=HTMLResponse)
+def decision_form(challenge_id: str, token: str, db: Session = Depends(get_db)) -> HTMLResponse:
+    """The page the SMS/email link opens. A GET only shows the question; the
+    answer is a POST, so a link preview in a messaging app cannot approve it."""
+    challenge = _load_challenge(db, challenge_id)
+    if not secrets.compare_digest(challenge.decision_hash, _sha(token)):
+        return _decision_page("Invalid link", "<h1>Invalid link</h1><p>This link is not valid.</p>")
+    if challenge.status != "pending":
+        return _decision_page("Already answered",
+                              f"<h1>Already answered</h1><p>This sign-in request is {challenge.status}.</p>")
+    when = as_utc(challenge.created_at).strftime("%d %b %Y, %H:%M UTC")
+    return _decision_page("Is this you?", f"""
+<h1>New sign-in detected</h1>
+<p>Someone entered the correct password for your E-Panchayat account from a device we do not recognise. <b>Is this you?</b></p>
+<dl><dt>Device</dt><dd>{html.escape(challenge.label or "Unknown")}</dd>
+<dt>IP address</dt><dd>{html.escape(challenge.ip or "Unknown")}</dd><dt>Time</dt><dd>{when}</dd></dl>
+<form method="post" class="r"><input type="hidden" name="token" value="{html.escape(token)}">
+<button class="a" name="action" value="approve">Yes, approve</button>
+<button class="d" name="action" value="deny">No, deny entry</button></form>""")
+
+
+@router.post("/login-challenges/{challenge_id}/decide", response_class=HTMLResponse)
+def decide(
+    challenge_id: str,
+    request: Request,
+    token: str = Form(...),
+    action: str = Form(...),
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    challenge = _load_challenge(db, challenge_id)
+    if not secrets.compare_digest(challenge.decision_hash, _sha(token)) or action not in ("approve", "deny"):
+        return _decision_page("Invalid link", "<h1>Invalid link</h1><p>This link is not valid.</p>")
+    if challenge.status != "pending":
+        return _decision_page("Already answered",
+                              f"<h1>Already answered</h1><p>This sign-in request is {challenge.status}.</p>")
+    challenge.status = "approved" if action == "approve" else "denied"
+    db.commit()
+    user = db.get(User, challenge.user_id)
+    ratelimit.record(db, email=user.email if user else "", ip=ratelimit.client_ip(request),
+                     outcome=f"device_{challenge.status}", user_id=challenge.user_id)
+    if action == "approve":
+        return _decision_page("Approved", "<h1>&#10003; Sign-in approved</h1>"
+                              "<p>The device will be signed in and remembered. You can close this page.</p>")
+    return _decision_page("Denied", "<h1>&#10007; Entry denied</h1><p>The device was blocked. Someone knows "
+                          "your password: change it now, or use <b>Forgot password</b> to reset it.</p>")
 
 
 @router.post("/refresh", response_model=TokenPair)
@@ -349,6 +561,159 @@ def redeem_password_reset(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Self-service recovery by OTP
+#
+# A resident who has forgotten their password asks for a six-digit OTP, sent to
+# the phone and email on record. Two conditions send them to the office instead:
+#
+#   * the account is locked — five wrong passwords inside the sign-in window.
+#     Someone who is guessing may also be holding the resident's phone, so an
+#     OTP is no longer enough; an officer verifies them in person and issues the
+#     office reset code (POST /auth/users/{id}/password-reset).
+#   * the account is staff. Officer and admin passwords are reset by an admin.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OTP_LOCKED = HTTPException(
+    status_code=status.HTTP_423_LOCKED,
+    detail=(
+        "This account is locked after repeated failed sign-in attempts. For your "
+        "security, visit the Gram Panchayat office: an officer will verify you and "
+        "give you a reset code."
+    ),
+)
+
+
+def _is_locked(db: Session, email: str) -> bool:
+    since = datetime.now(timezone.utc) - timedelta(minutes=settings.LOGIN_WINDOW_MINUTES)
+    return (
+        ratelimit._count_failures(db, since=since, email=email)
+        >= settings.LOGIN_MAX_FAILURES_PER_EMAIL
+    )
+
+
+def _mask_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone)
+    return f"SMS to ******{digits[-4:]}" if len(digits) >= 4 else "SMS"
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = email.partition("@")
+    return f"Email to {local[:1]}{'*' * max(len(local) - 1, 2)}@{domain}"
+
+
+@router.post("/forgot-password", response_model=OtpSent)
+def request_otp(
+    body: OtpRequest, request: Request, db: Session = Depends(get_db)
+) -> OtpSent:
+    email = _account_key(db, body.email, body.aadhaar)
+    ip = ratelimit.client_ip(request)
+
+    if _is_locked(db, email):
+        ratelimit.record(db, email=email, ip=ip, outcome="otp_locked")
+        raise _OTP_LOCKED
+
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    sent_recently = db.scalar(
+        select(func.count())
+        .select_from(AuthAttempt)
+        .where(AuthAttempt.email == email)
+        .where(AuthAttempt.outcome == "otp_sent")
+        .where(AuthAttempt.created_at >= since)
+    ) or 0
+    if sent_recently >= settings.OTP_MAX_PER_HOUR:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTPs requested. Wait an hour, or visit the Panchayat office.",
+            headers={"Retry-After": "3600"},
+        )
+
+    user = db.scalar(select(User).where(User.email == email))
+    if user is None or not user.is_active or user.role != "citizen":
+        # Staff and unknown accounts get the same answer: nothing self-service.
+        ratelimit.record(db, email=email, ip=ip, outcome="otp_refused")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "We could not send an OTP for that account. Residents can recover "
+                "access at the Panchayat office; staff should contact the administrator."
+            ),
+        )
+
+    otp = generate_otp()
+    now = datetime.now(timezone.utc)
+    # A new OTP voids any earlier unused one, office codes included.
+    for old in db.scalars(
+        select(PasswordReset)
+        .where(PasswordReset.user_id == user.id)
+        .where(PasswordReset.used_at.is_(None))
+    ):
+        old.used_at = now
+    db.add(PasswordReset(
+        id=f"pwr_{uuid4().hex[:16]}",
+        user_id=user.id,
+        hashed_code=hash_password(otp),
+        issued_by_id=None,  # None marks a self-service OTP
+        expires_at=now + timedelta(minutes=settings.OTP_TTL_MINUTES),
+    ))
+    db.commit()
+
+    phone = user.citizen.phone if user.citizen else None
+    sent_to = notify.send_otp(otp, phone=phone, email=user.email)
+    ratelimit.record(db, email=email, ip=ip, outcome="otp_sent", user_id=user.id)
+
+    return OtpSent(
+        sent_to=[*( [_mask_phone(phone)] if phone else []), _mask_email(user.email)]
+        if sent_to else [],
+        expires_in_minutes=settings.OTP_TTL_MINUTES,
+        demo_otp=otp if settings.OTP_DEMO_MODE else None,
+    )
+
+
+@router.post("/forgot-password/verify", status_code=status.HTTP_204_NO_CONTENT)
+def verify_otp(body: OtpReset, request: Request, db: Session = Depends(get_db)) -> None:
+    email = _account_key(db, body.email, body.aadhaar)
+    ip = ratelimit.client_ip(request)
+
+    try:
+        ratelimit.check_reset_allowed(db, email, ip)
+    except HTTPException:
+        ratelimit.record(db, email=email, ip=ip, outcome="rate_limited")
+        raise
+    if _is_locked(db, email):
+        raise _OTP_LOCKED
+
+    refused = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="That OTP is not valid or has expired. Request a new one.",
+    )
+    user = db.scalar(select(User).where(User.email == email))
+    reset = None
+    if user is not None:
+        reset = db.scalar(
+            select(PasswordReset)
+            .where(PasswordReset.user_id == user.id)
+            .where(PasswordReset.used_at.is_(None))
+            .where(PasswordReset.issued_by_id.is_(None))
+            .order_by(PasswordReset.created_at.desc())
+        )
+    entered = "".join(ch for ch in body.otp if ch.isdigit())
+    if (
+        user is None
+        or reset is None
+        or as_utc(reset.expires_at) <= datetime.now(timezone.utc)
+        or not verify_password(entered, reset.hashed_code)
+    ):
+        ratelimit.record(db, email=email, ip=ip, outcome="reset_bad_code")
+        raise refused
+
+    user.hashed_password = hash_password(body.new_password)
+    _revoke_existing_sessions(user)
+    reset.used_at = datetime.now(timezone.utc)
+    db.commit()
+    ratelimit.record(db, email=email, ip=ip, outcome="otp_redeemed", user_id=user.id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Registration
 #
 # A resident can apply for an account. Applying never creates a working login:
@@ -544,11 +909,16 @@ def decide_registration(
         db.refresh(req)
         return _registration_out(db, req)
 
-    if not body.citizen_id:
+    if db.scalar(select(User).where(User.email == req.email)):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Approving an application requires choosing the resident record it belongs to.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with that email already exists.",
         )
+
+    if not body.citizen_id:
+        # No register match chosen: the officer has decided to accept the
+        # applicant as a new resident, so a record is created from the form.
+        body.citizen_id = _citizen_from_application(db, req, scope)
     citizen = db.get(Citizen, body.citizen_id)
     if citizen is None:
         raise HTTPException(
@@ -593,6 +963,35 @@ def decide_registration(
     db.commit()
     db.refresh(req)
     return _registration_out(db, req)
+
+
+def _citizen_from_application(db: Session, req: RegistrationRequest, scope: str | None) -> str:
+    """Register an applicant who is not on the village register by creating a
+    resident record from what they applied with. Attributes the form does not
+    collect are left at neutral defaults for an officer to complete."""
+    village_id = req.village_id or scope
+    if village_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The application names no village. Ask the applicant which Gram Panchayat they belong to.",
+        )
+    citizen = Citizen(
+        id=f"cit_{uuid4().hex[:8]}",
+        name=req.full_name,
+        name_mr=req.full_name,
+        age=18,
+        gender="Other",
+        gender_mr="इतर",
+        occupation="Not recorded",
+        occupation_mr="नोंद नाही",
+        income=0,
+        ward=req.claimed_ward or 1,
+        village_id=village_id,
+        phone=req.phone,
+    )
+    db.add(citizen)
+    db.flush()
+    return citizen.id
 
 
 @router.get("/users", response_model=list[UserOut])

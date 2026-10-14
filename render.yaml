@@ -60,7 +60,7 @@ services:
         sync: false
 
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.7-flash
       - key: GEMINI_EMBED_MODEL
         value: gemini-embedding-001
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
@@ -78,7 +78,6 @@ services:
   - type: web
     name: epanchayat-web
     runtime: static
-    plan: free
     branch: main
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist
@@ -95,6 +94,9 @@ services:
       #   https://epanchayat-api.onrender.com/api/v1
       - key: VITE_API_URL
         sync: false
+      # Vite 8 needs Node 20.19+; pin it so Render never builds on an older one.
+      - key: NODE_VERSION
+        value: "22"
 
     routes:
       # Serve index.html for any path that is not a built asset. The app keeps

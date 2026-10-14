@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 def to_camel(s: str) -> str:
@@ -33,9 +33,24 @@ Role = Literal["admin", "officer", "citizen"]
 # Auth
 # ─────────────────────────────────────────────────────────────────────────────
 
-class LoginRequest(ApiModel):
-    email: EmailStr
+class _AccountIdentifier(ApiModel):
+    """An account named by email, or (for residents) by Aadhaar number."""
+
+    email: EmailStr | None = None
+    aadhaar: str | None = Field(default=None, max_length=20)
+
+    @model_validator(mode="after")
+    def _one_identifier(self):
+        if not self.email and not self.aadhaar:
+            raise ValueError("Enter an email address or an Aadhaar number.")
+        return self
+
+
+class LoginRequest(_AccountIdentifier):
     password: str = Field(min_length=1)
+    # A random id the browser generates once and keeps; see KnownDevice.
+    device_id: str | None = Field(default=None, max_length=100)
+    device_label: str | None = Field(default=None, max_length=200)
 
 
 class TokenPair(ApiModel):
@@ -43,6 +58,40 @@ class TokenPair(ApiModel):
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int
+
+
+class LoginChallengeOut(ApiModel):
+    """Returned with 202 instead of tokens when the device is not recognised."""
+
+    challenge_id: str
+    poll_token: str
+    sent_to: list[str]
+    expires_in_minutes: int
+    # Demo mode only: the approve/deny link that the SMS and email would carry.
+    demo_decision_url: str | None = None
+
+
+class LoginChallengeStatus(ApiModel):
+    status: str  # pending | approved | denied | expired
+    tokens: TokenPair | None = None
+
+
+class OtpRequest(_AccountIdentifier):
+    pass
+
+
+class OtpSent(ApiModel):
+    """Where the OTP went, masked. `demo_otp` is filled only in demo mode,
+    because no SMS or email gateway is connected yet."""
+
+    sent_to: list[str]
+    expires_in_minutes: int
+    demo_otp: str | None = None
+
+
+class OtpReset(_AccountIdentifier):
+    otp: str = Field(min_length=4, max_length=10)
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 class RefreshRequest(ApiModel):

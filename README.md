@@ -204,7 +204,7 @@ so the sign-up and officer-approval flow can be demonstrated end to end.
 ### Tests
 
 ```bash
-cd backend && python -m pytest        # 284 tests
+cd backend && python -m pytest        # 311 tests
 npm run build                          # typecheck + production build
 ```
 
@@ -396,6 +396,55 @@ has been trying". It pairs an email with an IP, which is personal data, so
 `services.ratelimit.prune()` drops anything older than ninety days. Nothing
 calls it automatically; there is no scheduler here, and claiming an enforced
 retention policy that nothing enforces would be worse than running it by hand.
+
+### Aadhaar sign-in and OTP recovery
+
+Residents can sign in with their **12-digit Aadhaar number** instead of an email.
+Aadhaar is never stored in the clear: `citizens.aadhaar_hash` is an HMAC keyed
+on `SECRET_KEY` (a plain hash of a 12-digit number could be brute-forced from a
+dump), plus the last four digits for display. Seeded residents get synthetic
+numbers `9999 0000 0NNN` from their citizen ID, so Savita (`cit_102`) is
+`9999 0000 0102`. Unknown numbers are throttled and refused exactly like unknown
+emails. Note: rotating `SECRET_KEY` invalidates these digests.
+
+**Forgot password** is now self-service: the resident enters their email or
+Aadhaar and gets a **6-digit OTP** on the phone and email on record (10-minute
+expiry, single use, at most 3 per hour, wrong guesses metered). Two cases still
+go to the office counter, using the reset code described below:
+
+- **The account is locked** after 5 failed sign-ins in 15 minutes. Whoever is
+  guessing may also hold the resident's phone, so an OTP is no longer enough
+  and the API answers `423 Locked`.
+- **Staff accounts**, which an admin resets.
+
+No SMS or email gateway is connected yet. `services/notify.py` is the one place
+to plug one in; until then `OTP_DEMO_MODE=true` (the default) returns the OTP in
+the API response and shows it on screen so the flow can be demonstrated. Turn it
+off in any deployment with real residents.
+
+### New-device sign-in approval
+
+Each browser keeps a random device id (`localStorage`, carries no personal
+data). The first device an account signs in from becomes its **home device**.
+A correct password from any *other* device does not sign in: the API answers
+`202` with a pending challenge and sends an **"Is this you?"** alert by SMS and
+email to the registered mobile and address, carrying a link with **Approve** and
+**Deny entry** buttons. The waiting browser polls; on approval it receives its
+tokens once and the device is remembered, and on denial it gets nothing and the
+owner is told to change their password.
+
+- Two separate secrets, both stored only as SHA-256: the *poll token* (held by
+  the waiting device) and the *decision token* (sent to the owner). Neither can
+  do the other's job.
+- The link's GET only shows the question; answering is a POST, so an SMS app's
+  link preview cannot approve a sign-in by fetching it.
+- Requests expire after `LOGIN_APPROVAL_TTL_MINUTES` (10). A wrong password
+  never triggers an alert.
+- In demo mode the link is shown on the waiting screen, since no SMS/email
+  gateway is connected (`services/notify.send_new_device_alert`).
+
+To demo it: sign in normally once, then sign in to the same account from an
+incognito window or a second browser.
 
 ### Password reset, over the counter
 

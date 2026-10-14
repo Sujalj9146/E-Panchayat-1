@@ -280,6 +280,14 @@ class Citizen(Base, TimestampMixin):
     )
     phone: Mapped[str | None] = mapped_column(String(30))
 
+    # Aadhaar is never stored in the clear. The digest is an HMAC keyed on
+    # SECRET_KEY, so it can be looked up at sign-in but cannot be reversed by
+    # brute force from a database dump alone (a plain hash of a 12-digit number
+    # would fall in hours). The last four digits are kept for display, which is
+    # what UIDAI's own masked-Aadhaar format shows.
+    aadhaar_hash: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    aadhaar_last4: Mapped[str | None] = mapped_column(String(4))
+
     family_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("families.id", ondelete="SET NULL"), index=True
     )
@@ -854,4 +862,58 @@ class AuthAttempt(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False, index=True
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New-device sign-in approval
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KnownDevice(Base):
+    """A browser this account has signed in from and trusts.
+
+    The first device an account ever signs in from becomes its home device.
+    Any other device is held at sign-in until the owner approves it from the
+    SMS or email alert. Only a SHA-256 of the browser's random device id is kept.
+    """
+
+    __tablename__ = "known_devices"
+    __table_args__ = (UniqueConstraint("user_id", "device_hash", name="uq_known_device"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    device_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class LoginChallenge(Base):
+    """A sign-in from an unknown device, waiting for the owner's answer.
+
+    Two secrets, both stored only as SHA-256: the poll token, held by the device
+    that is trying to sign in, and the decision token, sent to the owner by SMS
+    and email. Only the owner can approve; only the waiting device can collect
+    the tokens once approved.
+    """
+
+    __tablename__ = "login_challenges"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    device_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(200))
+    ip: Mapped[str | None] = mapped_column(String(64))
+    poll_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # pending | approved | denied | used
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
     )
