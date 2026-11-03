@@ -1,9 +1,6 @@
 # E-Panchayat
 
-An AI-assisted decision support system for Gram Panchayat administration.
-Citizen records, welfare schemes and eligibility, grievances, development
-projects, Gram Sabha minutes, GIS and analytics — for 23 villages of Haveli
-block, Pune district, Maharashtra.
+E-Panchayat is an online platform developed to help people access Panchayat-related services and understand various government schemes easily. It is built to support 23 villages and allows users to access information in both English and Marathi. The application uses Python, FastAPI, React, PostgreSQL, and Gemini API. It also has an AI chatbot that answers users' questions about government schemes and helps them check whether they are eligible. The platform includes information on 29 schemes and uses RAG to provide answers based on relevant information. Working on this project provided practical exposure to web development, database operations, API integration, and AI-based applications.
 
 Sem-7 capstone, Group BCC28, MIT School of Computing, MIT-ADT University Pune.
 Guide: Prof. Jyoti Gavhane.
